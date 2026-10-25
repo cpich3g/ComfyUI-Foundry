@@ -1,14 +1,10 @@
+--extra-index-url https://download.pytorch.org/whl/cpu
 comfyui-frontend-package==1.57.1
-comfyui-workflow-templates==0.11.94
 comfyui-embedded-docs==0.5.14
-torch
-torchsde
-torchvision
+torch==2.9.1+cpu; sys_platform != "darwin"
+torch==2.9.1; sys_platform == "darwin"
 numpy>=1.25.0
 einops
-transformers>=4.50.3
-tokenizers>=0.13.3
-sentencepiece
 safetensors>=0.4.2
 aiohttp>=3.11.8
 yarl>=1.18.0
@@ -21,16 +17,11 @@ alembic
 SQLAlchemy>=2.0.0
 filelock
 av>=17.0.0
-comfy-kitchen==0.2.39
-comfy-aimdo==0.5.6
 requests
+azure-identity>=1.17.0
 simpleeval>=1.0.0
 blake3
 
 #non essential dependencies:
-kornia>=0.7.1
-spandrel
 pydantic~=2.0
 pydantic-settings~=2.0
-PyOpenGL>=3.1.8
-comfy-angle

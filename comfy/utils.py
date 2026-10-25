@@ -18,191 +18,17 @@
 
 
 import torch
+import time
 import math
 import struct
-import ctypes
-import os
-import comfy.memory_management
-import comfy.storage
 import safetensors.torch
 import numpy as np
 from PIL import Image
 import logging
 import itertools
 from torch.nn.functional import interpolate
-from tqdm.auto import trange
 from einops import rearrange
-from comfy.cli_args import args
 import json
-import time
-import threading
-import warnings
-
-MMAP_TORCH_FILES = args.mmap_torch_files
-DISABLE_MMAP = args.disable_mmap
-
-
-if True:  # ckpt/pt file whitelist for safe loading of old sd files
-    class ModelCheckpoint:
-        pass
-    ModelCheckpoint.__module__ = "pytorch_lightning.callbacks.model_checkpoint"
-
-    def scalar(*args, **kwargs):
-        return None
-    scalar.__module__ = "numpy.core.multiarray"
-
-    from numpy import dtype
-    from numpy.dtypes import Float64DType
-
-    def encode(*args, **kwargs):  # no longer necessary on newer torch
-        return None
-    encode.__module__ = "_codecs"
-
-    torch.serialization.add_safe_globals([ModelCheckpoint, scalar, dtype, Float64DType, encode])
-    logging.info("Checkpoint files will always be loaded safely.")
-
-
-# Current as of safetensors 0.7.0
-_TYPES = {
-    "F64": torch.float64,
-    "F32": torch.float32,
-    "F16": torch.float16,
-    "BF16": torch.bfloat16,
-    "I64": torch.int64,
-    "I32": torch.int32,
-    "I16": torch.int16,
-    "I8": torch.int8,
-    "U8": torch.uint8,
-    "BOOL": torch.bool,
-    "F8_E4M3": torch.float8_e4m3fn,
-    "F8_E5M2": torch.float8_e5m2,
-    "C64": torch.complex64,
-
-    "U64": torch.uint64,
-    "U32": torch.uint32,
-    "U16": torch.uint16,
-}
-
-_SAFETENSORS_MAX_HEADER_SIZE = 100_000_000
-
-
-def _invalid_safetensors_error(message, ckpt):
-    return ValueError("{}\n\nFile path: {}\n\nThe safetensors file is corrupt or invalid. Make sure this is actually a safetensors file and not a ckpt or pt or other filetype.".format(message, ckpt))
-
-
-def _incomplete_safetensors_error(message, ckpt):
-    return ValueError("{}\n\nFile path: {}\n\nThe safetensors file is corrupt/incomplete. Check the file size and make sure you have copied/downloaded it correctly.".format(message, ckpt))
-
-
-def load_safetensors(ckpt):
-    import comfy_aimdo.model_mmap
-
-    file_size = os.path.getsize(ckpt)
-    if file_size < 8:
-        raise _incomplete_safetensors_error("The safetensors header is incomplete.", ckpt)
-
-    file_lock = threading.Lock()
-    model_mmap = comfy_aimdo.model_mmap.ModelMMAP(ckpt)
-    f = model_mmap.get_file_handle()
-    mv = memoryview((ctypes.c_uint8 * file_size).from_address(model_mmap.get()))
-
-    header_size = struct.unpack("<Q", mv[:8])[0]
-    if header_size > _SAFETENSORS_MAX_HEADER_SIZE:
-        raise _invalid_safetensors_error("The safetensors header is too large.", ckpt)
-
-    data_base_offset = 8 + header_size
-    if data_base_offset > file_size:
-        raise _incomplete_safetensors_error("The safetensors header is incomplete.", ckpt)
-
-    try:
-        header = json.loads(mv[8:data_base_offset].tobytes().decode("utf-8"))
-    except (UnicodeDecodeError, json.JSONDecodeError) as e:
-        raise _invalid_safetensors_error(str(e), ckpt) from e
-
-    if not isinstance(header, dict):
-        raise _invalid_safetensors_error("The safetensors header is invalid.", ckpt)
-
-    mv = mv[data_base_offset:]
-    data_size = len(mv)
-
-    sd = {}
-    for name, info in header.items():
-        if name == "__metadata__":
-            continue
-
-        start, end = info["data_offsets"]
-        dtype = _TYPES[info["dtype"]]
-        if start < 0 or end < start:
-            raise _invalid_safetensors_error("Tensor '{}' has invalid data offsets.".format(name), ckpt)
-        if end > data_size:
-            raise _incomplete_safetensors_error("Tensor '{}' extends past the end of the file.".format(name), ckpt)
-        if math.prod(info["shape"]) * dtype.itemsize != end - start:
-            raise _invalid_safetensors_error("Tensor '{}' does not match its declared shape and dtype.".format(name), ckpt)
-
-        if start == end:
-            sd[name] = torch.empty(info["shape"], dtype=dtype)
-        else:
-            with warnings.catch_warnings():
-                #We are working with read-only RAM by design
-                warnings.filterwarnings("ignore", message="The given buffer is not writable")
-                tensor = torch.frombuffer(mv[start:end], dtype=dtype).view(info["shape"])
-                storage = tensor.untyped_storage()
-                setattr(storage,
-                        "_comfy_tensor_file_slice",
-                        comfy.memory_management.TensorFileSlice(f, file_lock, data_base_offset + start, end - start))
-                setattr(storage, "_comfy_tensor_mmap_refs", (model_mmap, mv))
-                sd[name] = tensor
-
-    return sd, header.get("__metadata__", {}),
-
-
-def load_torch_file(ckpt, safe_load=False, device=None, return_metadata=False):
-    if device is None:
-        device = torch.device("cpu")
-    metadata = None
-    if ckpt.lower().endswith(".safetensors") or ckpt.lower().endswith(".sft"):
-        try:
-            if comfy.memory_management.aimdo_enabled:
-                sd, metadata = load_safetensors(ckpt)
-                if not return_metadata:
-                    metadata = None
-            else:
-                with safetensors.safe_open(ckpt, framework="pt", device=device.type) as f:
-                    sd = {}
-                    for k in f.keys():
-                        tensor = f.get_tensor(k)
-                        if DISABLE_MMAP:  # TODO: Not sure if this is the best way to bypass the mmap issues
-                            tensor = tensor.to(device=device, copy=True)
-                        sd[k] = tensor
-                    if return_metadata:
-                        metadata = f.metadata()
-        except Exception as e:
-            if len(e.args) > 0:
-                message = e.args[0]
-                if "HeaderTooLarge" in message:
-                    raise _invalid_safetensors_error(message, ckpt)
-                if "MetadataIncompleteBuffer" in message:
-                    raise _incomplete_safetensors_error(message, ckpt)
-            raise e
-    else:
-        torch_args = {}
-        if MMAP_TORCH_FILES:
-            torch_args["mmap"] = True
-
-        pl_sd = torch.load(ckpt, map_location=device, weights_only=True, **torch_args)
-
-        if "state_dict" in pl_sd:
-            sd = pl_sd["state_dict"]
-        else:
-            if len(pl_sd) == 1:
-                key = list(pl_sd.keys())[0]
-                sd = pl_sd[key]
-                if not isinstance(sd, dict):
-                    sd = pl_sd
-            else:
-                sd = pl_sd
-    comfy.storage.annotate_state_dict(sd, ckpt)
-    return (sd, metadata) if return_metadata else sd
 
 def save_torch_file(sd, ckpt, metadata=None):
     if metadata is not None:
@@ -1263,31 +1089,6 @@ def tiled_scale_multidim(samples, function, tile=(64, 64), overlap=8, upscale_am
 def tiled_scale(samples, function, tile_x=64, tile_y=64, overlap = 8, upscale_amount = 4, out_channels = 3, output_device="cpu", pbar = None):
     return tiled_scale_multidim(samples, function, (tile_y, tile_x), overlap=overlap, upscale_amount=upscale_amount, out_channels=out_channels, output_device=output_device, pbar=pbar)
 
-def model_trange(*args, **kwargs):
-    if not comfy.memory_management.aimdo_enabled:
-        return trange(*args, **kwargs)
-
-    pbar = trange(*args, **kwargs, smoothing=1.0)
-    pbar._i = 0
-    pbar.set_postfix_str("  Model Initializing ...  ")
-
-    _update = pbar.update
-
-    def warmup_update(n=1):
-        pbar._i += 1
-        if pbar._i == 1:
-            pbar.i1_time = time.time()
-            pbar.set_postfix_str(" Model Initialization complete!  ")
-        elif pbar._i == 2:
-            #bring forward the effective start time based the diff between first and second iteration
-            #to attempt to remove load overhead from the final step rate estimate.
-            pbar.start_t = pbar.i1_time - (time.time() - pbar.i1_time)
-            pbar.set_postfix_str("")
-
-        _update(n)
-
-    pbar.update = warmup_update
-    return pbar
 
 PROGRESS_BAR_ENABLED = True
 def set_progress_bar_enabled(enabled):

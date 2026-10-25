@@ -43,7 +43,7 @@ from comfy_api import feature_flags
 from comfy.comfy_api_env import get_environment_overrides
 import node_helpers
 from comfyui_version import __version__
-from app.frontend_management import FrontendManager, parse_version
+from app.frontend_management import FrontendManager
 from comfy_api.internal import _ComfyNodeInternal
 from app.assets.event_log import emit
 from app.database.db import dependencies_available
@@ -834,6 +834,10 @@ class PromptServer():
         async def get_default_workflow(request):
             return web.FileResponse(os.path.join(os.path.dirname(os.path.realpath(__file__)), "default_workflow.json"), headers={"Cache-Control": "no-cache"})
 
+        @routes.get("/templates/index.json")
+        async def templates_index(request):
+            return web.json_response([])
+
         @routes.get("/prompt")
         async def get_prompt(request):
             return web.json_response(self.get_queue_info())
@@ -1345,32 +1349,6 @@ class PromptServer():
         # Add routes from web extensions.
         for name, dir in nodes.EXTENSION_WEB_DIRS.items():
             self.app.add_routes([web.static('/extensions/' + name, dir)])
-
-        installed_templates_version = FrontendManager.get_installed_templates_version()
-        use_legacy_templates = True
-        if installed_templates_version:
-            try:
-                use_legacy_templates = (
-                    parse_version(installed_templates_version)
-                    < parse_version("0.3.0")
-                )
-            except Exception as exc:
-                logging.warning(
-                    "Unable to parse templates version '%s': %s",
-                    installed_templates_version,
-                    exc,
-                )
-
-        if use_legacy_templates:
-            workflow_templates_path = FrontendManager.legacy_templates_path()
-            if workflow_templates_path:
-                self.app.add_routes([
-                    web.static('/templates', workflow_templates_path)
-                ])
-        else:
-            handler = FrontendManager.template_asset_handler()
-            if handler:
-                self.app.router.add_get("/templates/{path:.*}", handler)
 
         # Serve embedded documentation from the package
         embedded_docs_path = FrontendManager.embedded_docs_path()

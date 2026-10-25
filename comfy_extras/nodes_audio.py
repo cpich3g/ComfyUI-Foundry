@@ -5,194 +5,10 @@ import comfy.model_management
 import folder_paths
 import os
 import hashlib
-import node_helpers
 import logging
+from typing import BinaryIO
 from typing_extensions import override
 from comfy_api.latest import ComfyExtension, IO, UI
-from server import PromptServer
-
-class EmptyLatentAudio(IO.ComfyNode):
-    @classmethod
-    def define_schema(cls):
-        return IO.Schema(
-            node_id="EmptyLatentAudio",
-            display_name="Empty Latent Audio",
-            category="model/latent",
-            essentials_category="Audio",
-            inputs=[
-                IO.Float.Input("seconds", default=47.6, min=1.0, max=1000.0, step=0.1),
-                IO.Int.Input(
-                    "batch_size", default=1, min=1, max=4096, tooltip="The number of latent images in the batch.",
-                ),
-            ],
-            outputs=[IO.Latent.Output()],
-        )
-
-    @classmethod
-    def execute(cls, seconds, batch_size) -> IO.NodeOutput:
-        length = round((seconds * 44100 / 2048) / 2) * 2
-        latent = torch.zeros([batch_size, 64, length], device=comfy.model_management.intermediate_device())
-        return IO.NodeOutput({"samples": latent, "type": "audio", "downscale_ratio_temporal": 2048})
-
-    generate = execute  # TODO: remove
-
-
-class ConditioningStableAudio(IO.ComfyNode):
-    @classmethod
-    def define_schema(cls):
-        return IO.Schema(
-            node_id="ConditioningStableAudio",
-            category="model/conditioning/stable audio",
-            inputs=[
-                IO.Conditioning.Input("positive"),
-                IO.Conditioning.Input("negative"),
-                IO.Float.Input("seconds_start", default=0.0, min=0.0, max=1000.0, step=0.1),
-                IO.Float.Input("seconds_total", default=47.0, min=0.0, max=1000.0, step=0.1),
-            ],
-            outputs=[
-                IO.Conditioning.Output(display_name="positive"),
-                IO.Conditioning.Output(display_name="negative"),
-            ],
-        )
-
-    @classmethod
-    def execute(cls, positive, negative, seconds_start, seconds_total) -> IO.NodeOutput:
-        positive = node_helpers.conditioning_set_values(positive, {"seconds_start": seconds_start, "seconds_total": seconds_total})
-        negative = node_helpers.conditioning_set_values(negative, {"seconds_start": seconds_start, "seconds_total": seconds_total})
-        return IO.NodeOutput(positive, negative)
-
-    append = execute  # TODO: remove
-
-
-class VAEEncodeAudio(IO.ComfyNode):
-    @classmethod
-    def define_schema(cls):
-        return IO.Schema(
-            node_id="VAEEncodeAudio",
-            search_aliases=["audio to latent"],
-            display_name="VAE Encode Audio",
-            category="model/latent",
-            inputs=[
-                IO.Audio.Input("audio"),
-                IO.Vae.Input("vae"),
-            ],
-            outputs=[IO.Latent.Output()],
-        )
-
-    @classmethod
-    def execute(cls, vae, audio) -> IO.NodeOutput:
-        if audio is None:
-            raise ValueError("VAEEncodeAudio: input audio is None (source video may have no audio track).")
-        sample_rate = audio["sample_rate"]
-        vae_sample_rate = getattr(vae, "audio_sample_rate", 44100)
-        if vae_sample_rate != sample_rate:
-            waveform = comfy.audio.resample(audio["waveform"], sample_rate, vae_sample_rate)
-        else:
-            waveform = audio["waveform"]
-
-        t = vae.encode(waveform.movedim(1, -1))
-        return IO.NodeOutput({"samples": t})
-
-    encode = execute  # TODO: remove
-
-
-def vae_decode_audio(vae, samples, tile=None, overlap=None):
-    latent = samples["samples"]
-    if latent.is_nested:
-        latent = latent.unbind()[-1]
-
-    if tile is not None:
-        audio = vae.decode_tiled(latent, tile_x=tile, tile_y=tile, overlap=overlap).movedim(-1, 1)
-    else:
-        audio = vae.decode(latent).movedim(-1, 1)
-
-    std = torch.std(audio, dim=[1, 2], keepdim=True) * 5.0
-    std[std < 1.0] = 1.0
-    audio /= std
-    vae_sample_rate = getattr(vae, "audio_sample_rate_output", getattr(vae, "audio_sample_rate", 44100))
-    return {"waveform": audio, "sample_rate": vae_sample_rate if "sample_rate" not in samples else samples["sample_rate"]}
-
-
-class VAEDecodeAudio(IO.ComfyNode):
-    @classmethod
-    def define_schema(cls):
-        return IO.Schema(
-            node_id="VAEDecodeAudio",
-            search_aliases=["latent to audio"],
-            display_name="VAE Decode Audio",
-            category="model/latent",
-            inputs=[
-                IO.Latent.Input("samples"),
-                IO.Vae.Input("vae"),
-            ],
-            outputs=[IO.Audio.Output()],
-        )
-
-    @classmethod
-    def execute(cls, vae, samples) -> IO.NodeOutput:
-        return IO.NodeOutput(vae_decode_audio(vae, samples))
-
-    decode = execute  # TODO: remove
-
-
-class GetAudioLatentSize(IO.ComfyNode):
-    @classmethod
-    def define_schema(cls):
-        return IO.Schema(
-            node_id="GetAudioLatentSize",
-            search_aliases=["dimensions", "audio latent info", "audio latent length"],
-            display_name="Get Audio Latent Size",
-            description="Returns the length, audio channel count, and batch size of an audio latent.",
-            category="model/latent",
-            inputs=[
-                IO.Latent.Input("latent", tooltip="The audio or audio/video latent to inspect."),
-            ],
-            outputs=[
-                IO.Int.Output(display_name="length", tooltip="The audio latent length."),
-                IO.Int.Output(display_name="audio_channels", tooltip="The number of audio channels. Latents without an audio channel dimension have one channel."),
-                IO.Int.Output(display_name="batch_size", tooltip="The number of latents in the batch."),
-            ],
-            hidden=[IO.Hidden.unique_id],
-        )
-
-    @classmethod
-    def execute(cls, latent) -> IO.NodeOutput:
-        samples = latent["samples"]
-        if samples.is_nested:
-            samples = samples.unbind()[-1]
-
-        if samples.ndim == 4:
-            batch_size, _, audio_channels, length = samples.shape
-        else:
-            batch_size, _, length = samples.shape
-            audio_channels = 1
-
-        if cls.hidden.unique_id:
-            PromptServer.instance.send_progress_text(f"length: {length}, audio channels: {audio_channels}\n batch size: {batch_size}", cls.hidden.unique_id)
-
-        return IO.NodeOutput(length, audio_channels, batch_size)
-
-
-class VAEDecodeAudioTiled(IO.ComfyNode):
-    @classmethod
-    def define_schema(cls):
-        return IO.Schema(
-            node_id="VAEDecodeAudioTiled",
-            search_aliases=["latent to audio"],
-            display_name="VAE Decode Audio (Tiled)",
-            category="model/latent",
-            inputs=[
-                IO.Latent.Input("samples"),
-                IO.Vae.Input("vae"),
-                IO.Int.Input("tile_size", default=512, min=32, max=8192, step=8),
-                IO.Int.Input("overlap", default=64, min=0, max=1024, step=8),
-            ],
-            outputs=[IO.Audio.Output()],
-        )
-
-    @classmethod
-    def execute(cls, vae, samples, tile_size, overlap) -> IO.NodeOutput:
-        return IO.NodeOutput(vae_decode_audio(vae, samples, tile_size, overlap))
 
 
 class SaveAudio(IO.ComfyNode):
@@ -369,7 +185,7 @@ def f32_pcm(wav: torch.Tensor) -> torch.Tensor:
         return wav.float() / (2 ** 31)
     raise ValueError(f"Unsupported wav dtype: {wav.dtype}")
 
-def load(filepath: str) -> tuple[torch.Tensor, int]:
+def load(filepath: str | BinaryIO) -> tuple[torch.Tensor, int]:
     with av.open(filepath) as af:
         if not af.streams.audio:
             raise ValueError("No audio stream found in the file.")
@@ -909,18 +725,12 @@ class AudioExtension(ComfyExtension):
     @override
     async def get_node_list(self) -> list[type[IO.ComfyNode]]:
         return [
-            EmptyLatentAudio,
-            VAEEncodeAudio,
-            VAEDecodeAudio,
-            GetAudioLatentSize,
-            VAEDecodeAudioTiled,
             SaveAudio,
             SaveAudioMP3,
             SaveAudioOpus,
             SaveAudioAdvanced,
             LoadAudio,
             PreviewAudio,
-            ConditioningStableAudio,
             RecordAudio,
             TrimAudioDuration,
             SplitAudioChannels,

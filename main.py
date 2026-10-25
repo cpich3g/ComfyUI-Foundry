@@ -13,10 +13,8 @@ if args.list_feature_flags:
 import os
 import importlib.util
 import shutil
-import importlib.metadata
 import folder_paths
 import time
-from comfy.cli_args import enables_dynamic_vram
 from app import governance
 from app.logger import setup_logger
 console_log_level = get_console_log_level(args.verbose)
@@ -44,17 +42,6 @@ if __name__ == "__main__":
     os.environ['HF_HUB_DISABLE_TELEMETRY'] = '1'
     os.environ['DO_NOT_TRACK'] = '1'
 
-    import cuda_malloc
-
-    if (
-        os.name == "nt"
-        and args.cuda_device is None
-        and args.default_device is None
-        and os.environ.get("CUDA_VISIBLE_DEVICES") is None
-    ):
-        os.environ["CUDA_VISIBLE_DEVICES"] = "0"
-        logging.warning("On windows we are currently forcing single GPU mode in ComfyUI due to a Nvidia related issue, if you want to disable this use: --cuda-device all")
-
     if args.enable_asset_hashing and args.disable_assets:
         logging.warning("--enable-asset-hashing is ignored because the assets system is off. Start ComfyUI with --enable-assets, and without --disable-assets, to use it.")
 
@@ -75,44 +62,8 @@ if __name__ == "__main__" and args.debug_hang:
 
     signal.signal(signal.SIGINT, dump_traceback_on_sigint)
 
-import comfy_aimdo.control
-
-if enables_dynamic_vram():
-    simple_vram_headroom = None if args.reserve_vram is None else int(args.reserve_vram * 1024 ** 3)
-    comfy_aimdo.control.init(simple_vram_headroom=simple_vram_headroom, nvml_pressure=not args.disable_nvml_pressure)
-
 if os.name == "nt":
     os.environ['MIMALLOC_PURGE_DELAY'] = '0'
-
-if __name__ == "__main__":
-    os.environ['TORCH_ROCM_AOTRITON_ENABLE_EXPERIMENTAL'] = '1'
-    if args.default_device is not None and args.cuda_device != "all":
-        default_dev = args.default_device
-        devices = list(range(32))
-        devices.remove(default_dev)
-        devices.insert(0, default_dev)
-        devices = ','.join(map(str, devices))
-        os.environ['CUDA_VISIBLE_DEVICES'] = str(devices)
-        os.environ['HIP_VISIBLE_DEVICES'] = str(devices)
-
-    if args.cuda_device == "all":
-        logging.info("Set cuda devices to all")
-    elif args.cuda_device is not None:
-        os.environ['CUDA_VISIBLE_DEVICES'] = str(args.cuda_device)
-        os.environ['HIP_VISIBLE_DEVICES'] = str(args.cuda_device)
-        os.environ["ASCEND_RT_VISIBLE_DEVICES"] = str(args.cuda_device)
-        logging.info("Set cuda device to: {}".format(args.cuda_device))
-
-    if args.oneapi_device_selector is not None:
-        os.environ['ONEAPI_DEVICE_SELECTOR'] = args.oneapi_device_selector
-        logging.info("Set oneapi device selector to: {}".format(args.oneapi_device_selector))
-
-    if args.deterministic:
-        if 'CUBLAS_WORKSPACE_CONFIG' not in os.environ:
-            os.environ['CUBLAS_WORKSPACE_CONFIG'] = ":4096:8"
-
-    if "rocm" in cuda_malloc.get_torch_version_noimport():
-        os.environ['OCL_SET_SVM_SIZE'] = '4194304'  # 4TB. Much larger than the ROCM 64GB/256GB defaults for Aimdos liberal VA use
 
 
 def handle_comfyui_manager_unavailable():
@@ -181,59 +132,6 @@ def apply_custom_paths():
         folder_paths.set_user_directory(user_dir)
 
 
-def execute_prestartup_script():
-    if args.disable_all_custom_nodes and len(args.whitelist_custom_nodes) == 0:
-        return
-
-    def execute_script(script_path):
-        module_name = os.path.splitext(script_path)[0]
-        try:
-            spec = governance.pack_module_spec(module_name, script_path)
-            module = importlib.util.module_from_spec(spec)
-            spec.loader.exec_module(module)
-            return True
-        except Exception as e:
-            logging.error(f"Failed to execute startup-script: {script_path} / {e}")
-        return False
-
-    node_paths = folder_paths.get_folder_paths("custom_nodes")
-    node_prestartup_times = []
-    for custom_node_path in node_paths:
-        possible_modules = os.listdir(custom_node_path)
-
-        for possible_module in possible_modules:
-            module_path = os.path.join(custom_node_path, possible_module)
-
-            if args.enable_manager:
-                if comfyui_manager.should_be_disabled(module_path):
-                    continue
-
-            if os.path.isfile(module_path) or module_path.endswith(".disabled") or module_path == "__pycache__":
-                continue
-
-            refusal = governance.pack_refusal(module_path)
-            if refusal is not None:
-                logging.warning(refusal)
-                continue
-
-            script_path = os.path.join(module_path, "prestartup_script.py")
-            if os.path.exists(script_path):
-                if args.disable_all_custom_nodes and possible_module not in args.whitelist_custom_nodes:
-                    logging.info(f"Prestartup Skipping {possible_module} due to disable_all_custom_nodes and whitelist_custom_nodes")
-                    continue
-                time_before = time.perf_counter()
-                success = execute_script(script_path)
-                node_prestartup_times.append((time.perf_counter() - time_before, module_path, success))
-    if len(node_prestartup_times) > 0:
-        logging.info("\nPrestartup times for custom nodes:")
-        for n in sorted(node_prestartup_times):
-            if n[2]:
-                import_message = ""
-            else:
-                import_message = " (PRESTARTUP FAILED)"
-            logging.info("{:6.1f} seconds{}: {}".format(n[0], import_message, n[1]))
-        logging.info("")
-
 governance.initialize()
 apply_custom_paths()
 init_mime_types()
@@ -249,8 +147,6 @@ if args.enable_manager:
 
 if args.enable_manager:
     comfyui_manager.prestartup()
-
-execute_prestartup_script()
 
 
 # Main code
@@ -273,64 +169,6 @@ import comfy.model_management
 import comfyui_version
 import app.logger
 import hook_breaker_ac10a0
-
-import comfy.memory_management
-import comfy.model_patcher
-
-
-def dynamic_vram_supported():
-    if comfy.model_management.is_nvidia():
-        return True
-    if comfy.model_management.is_amd():
-        if comfy.model_management.rocm_version >= (7, 14):
-            return True
-    return False
-
-
-if args.enable_dynamic_vram or (enables_dynamic_vram() and dynamic_vram_supported()):
-    if (not args.enable_dynamic_vram) and (comfy.model_management.torch_version_numeric < (2, 8)):
-        logging.warning("Unsupported Pytorch detected. DynamicVRAM support requires Pytorch version 2.8 or later (2.12+ is recommended). Falling back to legacy ModelPatcher. VRAM estimates may be unreliable especially on Windows")
-    else:
-        try:
-            aimdo_initialized = comfy_aimdo.control.init_devices((d.index, int(args.vram_headroom * 1024 ** 3)) for d in comfy.model_management.get_all_torch_devices())
-        except TypeError:
-            # comfy-aimdo 0.4.9 protocol.
-            aimdo_initialized = comfy_aimdo.control.init_devices(d.index for d in comfy.model_management.get_all_torch_devices())
-
-        if aimdo_initialized:
-            if console_log_level == 'DEBUG':
-                comfy_aimdo.control.set_log_debug()
-            elif console_log_level == 'DETAIL':
-                try:
-                    comfy_aimdo.control.set_log_detail()
-                except AttributeError:
-                    comfy_aimdo.control.set_log_info()
-            elif console_log_level == 'CRITICAL':
-                comfy_aimdo.control.set_log_critical()
-            elif console_log_level == 'ERROR':
-                comfy_aimdo.control.set_log_error()
-            elif console_log_level == 'WARNING':
-                comfy_aimdo.control.set_log_warning()
-            else: #INFO
-                comfy_aimdo.control.set_log_info()
-
-            comfy.model_patcher.CoreModelPatcher = comfy.model_patcher.ModelPatcherDynamic
-            comfy.memory_management.aimdo_enabled = True
-            logging.info("DynamicVRAM support detected and enabled")
-        else:
-            logging.warning("No working comfy-aimdo install detected. DynamicVRAM support disabled. Falling back to legacy ModelPatcher. VRAM estimates may be unreliable especially on Windows")
-
-
-def cuda_malloc_warning():
-    device = comfy.model_management.get_torch_device()
-    device_name = comfy.model_management.get_torch_device_name(device)
-    cuda_malloc_warning = False
-    if "cudaMallocAsync" in device_name:
-        for b in cuda_malloc.blacklist:
-            if b in device_name:
-                cuda_malloc_warning = True
-        if cuda_malloc_warning:
-            logging.warning("\nWARNING: this card most likely does not support cuda-malloc, if you get \"CUDA error\" please run ComfyUI with: --disable-cuda-malloc\n")
 
 
 def prompt_worker(q, server_instance, asset_manager):
@@ -412,7 +250,6 @@ def prompt_worker(q, server_instance, asset_manager):
             free_memory = flags.get("free_memory", False)
 
             if flags.get("unload_models", free_memory):
-                comfy.model_management.unload_all_models()
                 need_gc = True
                 last_gc_collect = 0
 
@@ -425,7 +262,6 @@ def prompt_worker(q, server_instance, asset_manager):
                 current_time = time.perf_counter()
                 if (current_time - last_gc_collect) > gc_collect_interval:
                     gc.collect()
-                    comfy.model_management.soft_empty_cache()
                     last_gc_collect = current_time
                     need_gc = False
                     hook_breaker_ac10a0.restore_functions()
@@ -604,19 +440,14 @@ def start_comfyui(asyncio_loop=None):
 
     hook_breaker_ac10a0.save_functions()
     asyncio_loop.run_until_complete(nodes.init_extra_nodes(
-        init_custom_nodes=(not args.disable_all_custom_nodes) or len(args.whitelist_custom_nodes) > 0,
+        init_custom_nodes=(not args.disable_all_custom_nodes) or "foundry" in args.whitelist_custom_nodes,
         init_api_nodes=not args.disable_partner_nodes
     ))
     disabled_nodes = governance.load_disabled_nodes(args.disabled_nodes_config) if args.disabled_nodes_config else set()
     governance.apply_disabled_nodes(disabled_nodes)
 
-    # Re-apply Comfy's cuDNN benchmark policy after custom-node imports. Benchmark
-    # mode can request near-card-sized autotune workspaces, and some custom nodes set it at import time.
-    comfy.model_management.set_cudnn_benchmark()
-
     hook_breaker_ac10a0.restore_functions()
 
-    cuda_malloc_warning()
     setup_database(asset_manager)
 
     prompt_server.add_routes()
@@ -660,25 +491,12 @@ if __name__ == "__main__":
     # Running directly, just start ComfyUI.
     logging.info("Python version: {}".format(sys.version))
     logging.info("ComfyUI version: {}".format(comfyui_version.__version__))
-    for package in ("comfy-aimdo", "comfy-kitchen"):
-        try:
-            logging.info("{} version: {}".format(package, importlib.metadata.version(package)))
-        except:
-            pass
 
     if sys.version_info.major == 3 and sys.version_info.minor < 10:
         logging.warning("WARNING: You are using a python version older than 3.10, please upgrade to a newer one. 3.12 and above is recommended.")
     if sys.version_info.major == 3 and sys.version_info.minor == 10:
         logging.warning("WARNING: Python 3.10 will be EOL on October 31 2026, please consider upgrading to a newer version.")
 
-    if args.disable_dynamic_vram:
-        logging.warning(
-            "Dynamic vram disabled with argument. If you have any issues with "
-            "dynamic vram enabled please give us a detailed reports as this "
-            "argument will be removed soon. If you use gguf we recommend keeping "
-            "dynamic vram enabled and using native ComfyUI model formats instead. "
-            "ComfyUI native formats like fp8, int8 and w4a8 will be faster even if they are larger than your memory."
-        )
     event_loop, prompt_server, start_all_func = start_comfyui()
     try:
         x = start_all_func()

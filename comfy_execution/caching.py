@@ -5,7 +5,6 @@ import logging
 import time
 import torch
 from typing import Sequence, Mapping, Dict
-from comfy.model_patcher import is_model_patcher_output
 from comfy.system_memory import virtual_memory_available
 from comfy_execution.graph import DynamicPrompt
 from abc import ABC, abstractmethod
@@ -585,9 +584,6 @@ class RAMPressureCache(LRUCache):
                             seen_storages.add(storage_key)
                             ram_usage += storage.nbytes()
                             oom_ram_usage += storage.nbytes()
-                    elif is_model_patcher_output(output) and self.used_generation[key] != self.generation:
-                        #old ModelPatchers are the first to go
-                        oom_ram_usage = 1e30
                     elif hasattr(output, "_comfy_cache_tensors"):
                         scan_list_for_ram_usage(output._comfy_cache_tensors())
             try:
