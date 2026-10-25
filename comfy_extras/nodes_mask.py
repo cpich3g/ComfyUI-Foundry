@@ -47,36 +47,6 @@ def composite(destination, source, x, y, mask = None, multiplier = 8, resize_sou
     return destination
 
 
-class LatentCompositeMasked(IO.ComfyNode):
-    @classmethod
-    def define_schema(cls):
-        return IO.Schema(
-            node_id="LatentCompositeMasked",
-            search_aliases=["overlay latent", "layer latent", "paste latent", "inpaint latent"],
-            display_name="Latent Composite Masked",
-            category="model/latent",
-            inputs=[
-                IO.Latent.Input("destination"),
-                IO.Latent.Input("source"),
-                IO.Int.Input("x", default=0, min=0, max=nodes.MAX_RESOLUTION, step=8),
-                IO.Int.Input("y", default=0, min=0, max=nodes.MAX_RESOLUTION, step=8),
-                IO.Boolean.Input("resize_source", default=False),
-                IO.Mask.Input("mask", optional=True),
-            ],
-            outputs=[IO.Latent.Output()],
-        )
-
-    @classmethod
-    def execute(cls, destination, source, x, y, resize_source, mask = None) -> IO.NodeOutput:
-        output = destination.copy()
-        destination = destination["samples"].clone()
-        source = source["samples"]
-        output["samples"] = composite(destination, source, x, y, mask, 8, resize_source)
-        return IO.NodeOutput(output)
-
-    composite = execute  # TODO: remove
-
-
 class ImageCompositeMasked(IO.ComfyNode):
     @classmethod
     def define_schema(cls):
@@ -437,7 +407,6 @@ class MaskExtension(ComfyExtension):
     @override
     async def get_node_list(self) -> list[type[IO.ComfyNode]]:
         return [
-            LatentCompositeMasked,
             ImageCompositeMasked,
             MaskToImage,
             ImageToMask,

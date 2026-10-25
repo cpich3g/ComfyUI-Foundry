@@ -12,16 +12,11 @@ import asyncio
 
 import torch
 
-from comfy.cli_args import args, get_console_log_level
-import comfy.memory_management
+from comfy.cli_args import args
 import comfy.model_management
-import comfy.model_patcher
-import comfy.model_prefetch
 import comfy.system_memory
-import comfy_aimdo.model_vbar
 from comfy.internal_logging import detail
 
-from latent_preview import set_preview_method
 import nodes
 from comfy_execution.caching import (
     BasicCache,
@@ -544,15 +539,7 @@ async def execute(server: "ExecutionServer", dynprompt, caches, current_item, ex
                 # TODO - How to handle this with async functions without contextvars (which requires Python 3.12)?
                 GraphBuilder.set_default_prefix(unique_id, call_index, 0)
 
-            try:
-                output_data, output_ui, has_subgraph, has_pending_tasks = await get_output_data(prompt_id, unique_id, obj, input_data_all, execution_block_cb=execution_block_cb, pre_execute_cb=pre_execute_cb, v3_data=v3_data)
-            finally:
-                if comfy.memory_management.aimdo_enabled:
-                    if get_console_log_level(args.verbose) == "DEBUG":
-                        comfy_aimdo.control.analyze()
-                    comfy.model_prefetch.cleanup_prefetch_queues()
-                    comfy.model_management.reset_cast_buffers()
-                    comfy_aimdo.model_vbar.vbars_reset_watermark_limits()
+            output_data, output_ui, has_subgraph, has_pending_tasks = await get_output_data(prompt_id, unique_id, obj, input_data_all, execution_block_cb=execution_block_cb, pre_execute_cb=pre_execute_cb, v3_data=v3_data)
 
             if has_pending_tasks:
                 pending_async_nodes[unique_id] = output_data
@@ -641,12 +628,7 @@ async def execute(server: "ExecutionServer", dynprompt, caches, current_item, ex
         tips = ""
 
         if comfy.model_management.is_oom(ex):
-            tips = "This error means you ran out of memory on your GPU.\n\nTIPS: If the workflow worked before you might have accidentally set the batch_size to a large number."
-            logging.info("Memory summary:\n{}".format(comfy.model_management.debug_memory_summary()))
-            logging.error("Got an OOM, unloading all loaded models.")
-            comfy.model_management.unload_all_models()
-        elif isinstance(ex, RuntimeError) and ("mat1 and mat2 shapes" in str(ex)) and "Sampler" in class_type:
-            tips = "\n\nTIPS: If you have any \"Load CLIP\" or \"*CLIP Loader\" nodes in your workflow connected to this sampler node make sure the correct file(s) and type is selected."
+            tips = "The host ran out of RAM. Reduce the image size or batch size."
 
         error_details = {
             "node_id": real_node_id,
@@ -669,7 +651,6 @@ class PromptExecutor:
         self.cache_type = cache_type
         self.server = server
         self.asset_manager = asset_manager if asset_manager is not None else NoAssets(args)
-        self.prompt_model_tracker = comfy.model_patcher.PromptModelTracker()
         self.reset()
 
     def reset(self):
@@ -731,10 +712,7 @@ class PromptExecutor:
         asyncio.run(self.execute_async(prompt, prompt_id, extra_data, execute_outputs))
 
     async def execute_async(self, prompt, prompt_id, extra_data={}, execute_outputs=[]):
-        set_preview_method(extra_data.get("preview_method"))
-
         nodes.interrupt_processing(False)
-        self.prompt_model_tracker.start()
 
         if "client_id" in extra_data:
             self.server.client_id = extra_data["client_id"]
@@ -748,7 +726,6 @@ class PromptExecutor:
         ram_headroom = int(self.cache_args["ram"] * (1024 ** 3))
         ram_inactive_headroom = int(self.cache_args["ram_inactive"] * (1024 ** 3))
         ram_release_callback = self.caches.outputs.ram_release if self.cache_type == CacheType.RAM_PRESSURE else None
-        comfy.memory_management.set_ram_cache_release_state(ram_release_callback, ram_headroom)
 
         try:
             with torch.inference_mode():
@@ -769,7 +746,6 @@ class PromptExecutor:
                     if result is not None
                 ]
 
-                comfy.model_management.cleanup_models_gc()
                 self.add_message("execution_cached",
                               { "nodes": cached_nodes, "prompt_id": prompt_id},
                               broadcast=False)
@@ -777,7 +753,7 @@ class PromptExecutor:
                 pending_async_nodes = {} # TODO - Unify this with pending_subgraph_results
                 ui_node_outputs = {}
                 executed = set()
-                execution_list = ExecutionList(dynamic_prompt, self.caches.outputs, self.prompt_model_tracker.add)
+                execution_list = ExecutionList(dynamic_prompt, self.caches.outputs)
                 current_outputs = self.caches.outputs.all_node_ids()
                 for node_id in list(execute_outputs):
                     execution_list.add_node(node_id)
@@ -805,13 +781,6 @@ class PromptExecutor:
                         if ram_shortfall > 0:
                             freed = ram_release_callback(ram_headroom, free_active=True, min_entry_size=RAM_CACHE_LARGE_INTERMEDIATE)
                             ram_shortfall -= freed
-                        if comfy.model_management.should_free_pins_for_ram_pressure(ram_shortfall):
-                            freed = comfy.model_management.free_pins(ram_shortfall + 512 * (1024 ** 2))
-                            if freed < ram_shortfall:
-                                if freed > 64 * (1024 ** 2):
-                                    # AIMDO MEM_DECOMMIT can outrun psutil.available catching up.
-                                    time.sleep(0.05)
-                                ram_release_callback(ram_headroom, free_active=True)
                 else:
                     # Only execute when the while-loop ends without break
                     # Send cached UI for intermediate output nodes that weren't executed
@@ -836,13 +805,9 @@ class PromptExecutor:
                     "meta": meta_outputs,
                 }
                 self.server.last_node_id = None
-                if comfy.model_management.DISABLE_SMART_MEMORY:
-                    comfy.model_management.unload_all_models()
         finally:
             if self.cache_type == CacheType.RAM_PRESSURE:
                 detail("RAM cache evictions: prompt=%s active=%s full=%s", prompt_id, self.caches.outputs.active_evictions, self.caches.outputs.full_evictions)
-            comfy.memory_management.set_ram_cache_release_state(None, 0)
-            self.prompt_model_tracker.end()
             self._notify_prompt_lifecycle("end", prompt_id)
 
 
